@@ -42,7 +42,7 @@ FUNCTIONS = '\n\n'.join(extract_function(name) for name in (
     'collectInstalledUserProtocols', 'collectProtocolUserIdentities',
     'readUserProtocols', 'selectUserProtocols', 'setUserProtocols',
     'refreshUserSubscriptions', 'addProtocolUsers',
-    'manageUserProtocols', 'addUser', 'removeUser',
+    'manageUserProtocols', 'viewUserProtocols', 'addUser', 'removeUser',
     'defaultBase64Code', 'getRealitySubscriptionPort', 'showAccounts',
 ))
 
@@ -222,7 +222,8 @@ addUser
     def test_user_collection_and_duplicate_checks_include_xhttp_only(self):
         self.apply([3])
         users = json.loads(self.run_shell('collectProtocolUserIdentities').stdout)
-        self.assertIn({'id': TARGET, 'key': 'alice'}, users)
+        self.assertIn({'id': TARGET, 'key': 'alice'},
+                      [{key: user[key] for key in ('id', 'key')} for user in users])
         before = self.snapshot()
         self.assertIn('UUID不可重复', self.run_shell('customUUID', TARGET + '\n').stdout)
         self.assertIn('email不可重复', self.run_shell('customUserEmail', 'alice\n').stdout)
@@ -403,7 +404,8 @@ addUser
         self.run_shell(f'setUserProtocols {TARGET} alice {shlex.quote(json.dumps(selected))}', env=env)
         self.assert_catalog_membership(selected, env)
         users = json.loads(self.run_shell('collectProtocolUserIdentities', env=env).stdout)
-        self.assertIn({'id': TARGET, 'key': 'alice'}, users)
+        self.assertIn({'id': TARGET, 'key': 'alice'},
+                      [{key: user[key] for key in ('id', 'key')} for user in users])
         tuic = json.loads((conf / '09_tuic_inbounds.json').read_text())['inbounds'][0]['users'][-1]
         self.assertEqual(tuic['uuid'], TARGET)
         self.assertEqual(tuic['password'], TARGET)
@@ -435,6 +437,32 @@ addUser
         env['TEST_SINGBOX_FAIL'] = '1'
         self.run_shell(f"setUserProtocols {TARGET} alice '[1,4]'", env=env, expected=1)
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_user_protocol_overview_shows_each_users_actual_subset(self):
+        self.apply([3])
+        self.apply([1, 2], OTHER, 'bob')
+        before = self.snapshot()
+        result = self.run_shell('reloadCore() { return 71; }; subscribe() { return 72; }; viewUserProtocols')
+        sections = {section.split('\n')[0]: section.split('\n')[1]
+                    for section in result.stdout.split('用户：')[1:]}
+        self.assertEqual(sections['alice'], '已授权：3.VLESS XHTTP [xray]')
+        self.assertEqual(sections['bob'], '已授权：1.VLESS TCP [xray]、2.VLESS vision reality [xray]')
+        self.assertEqual(before, self.snapshot())
+
+    def test_user_protocol_overview_reflects_changed_authorizations(self):
+        self.apply([3])
+        self.apply([2])
+        result = self.run_shell('viewUserProtocols')
+        alice = result.stdout.split('用户：alice\n')[1].split('\n\n')[0]
+        self.assertEqual(alice, '已授权：2.VLESS vision reality [xray]')
+
+    def test_user_protocol_overview_includes_cross_core_combinations(self):
+        conf, env = self.singbox()
+        self.add_singbox(conf, '06_hysteria2_inbounds.json', 'hysteria2')
+        self.run_shell(f"setUserProtocols {TARGET} alice '[3,4]'", env=env)
+        result = self.run_shell('viewUserProtocols', env=env)
+        alice = result.stdout.split('用户：alice\n')[1].split('\n\n')[0]
+        self.assertEqual(alice, '已授权：3.VLESS XHTTP [xray]、4.hysteria2 [sing-box]')
 
     def test_script_keeps_installer_entrypoint(self):
         self.assertEqual(SOURCE.rstrip().splitlines()[-1], 'menu')

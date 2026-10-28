@@ -6906,12 +6906,14 @@ collectProtocolUserIdentities() {
         path=$(jq -c '.path' <<<"${protocol}")
         identity=$(jq -r '.identity' <<<"${protocol}")
         name=$(jq -r '.name' <<<"${protocol}")
-        entries=$(jq -c --argjson path "${path}" --arg identity "${identity}" --arg name "${name}" '
-            [getpath($path)[] | {id:.[$identity],key:((.[$name] // "") | split("-")[0])} |
+        entries=$(jq -c --argjson path "${path}" --arg identity "${identity}" --arg name "${name}" --argjson protocol "${protocol}" '
+            [getpath($path)[] | {id:.[$identity],key:((.[$name] // "") | split("-")[0]),
+                protocols:[($protocol | {choice,label,core})]} |
              select(.id != null and .id != "" and .key != "")]' "${file}") || return 1
         users=$(jq -c --argjson entries "${entries}" '. + $entries' <<<"${users}") || return 1
     done < <(jq -c '.[]' <<<"${protocols}")
-    jq -c 'group_by(.id) | map({id:.[0].id,key:.[0].key}) | sort_by(.key,.id)' <<<"${users}"
+    jq -c 'group_by(.id) | map({id:.[0].id,key:.[0].key,
+        protocols:([.[].protocols[]] | unique_by(.choice))}) | sort_by(.key,.id)' <<<"${users}"
 }
 
 readUserProtocols() {
@@ -9556,6 +9558,7 @@ manageAccount() {
     echoContent yellow "5.删除用户"
     echoContent yellow "6.生成/更新订阅（全部用户）"
     echoContent yellow "7.修改用户协议（从已安装列表选择）"
+    echoContent yellow "8.查看全部用户协议"
     echoContent red "=============================================================="
     read -r -p "请输入:" manageAccountStatus
     if [[ "${manageAccountStatus}" == "1" ]]; then
@@ -9572,9 +9575,20 @@ manageAccount() {
         subscribe
     elif [[ "${manageAccountStatus}" == "7" ]]; then
         manageUserProtocols
+    elif [[ "${manageAccountStatus}" == "8" ]]; then
+        viewUserProtocols
     else
         echoContent red " ---> 选择错误"
     fi
+}
+
+# 只读取实际入站授权，汇总每个用户可用的协议。
+viewUserProtocols() {
+    readInstallType
+    local users
+    users=$(collectProtocolUserIdentities) || return 1
+    echoContent skyBlue "\n全部用户已授权协议（编号对应当前已安装列表）："
+    jq -r '.[] | "用户：\(.key)\n已授权：\(.protocols | map("\(.choice).\(.label) [\(.core)]") | join("、"))\n"' <<<"${users}"
 }
 
 viewAccountsByUser() {
