@@ -44,6 +44,7 @@ FUNCTIONS = '\n\n'.join(extract_function(name) for name in (
     'refreshUserSubscriptions', 'addProtocolUsers',
     'manageUserProtocols', 'viewUserProtocols', 'addUser', 'removeUser',
     'defaultBase64Code', 'getRealitySubscriptionPort', 'showAccounts',
+    'initXrayClients', 'initSingBoxClients',
 ))
 
 
@@ -123,7 +124,7 @@ getPublicIP() {{ printf '%s\\n' 192.0.2.10; }}
         return result
 
     def apply(self, choices, user=TARGET, name='alice'):
-        return self.run_shell(f'setUserProtocols {user} {name} {shlex.quote(json.dumps(choices))}')
+        return self.run_shell(f'setUserProtocols {user} {shlex.quote(name)} {shlex.quote(json.dumps(choices))}')
 
     def assert_membership(self, user, choices):
         for choice, (filename, index, _) in DEFINITIONS.items():
@@ -226,7 +227,7 @@ addUser
                       [{key: user[key] for key in ('id', 'key')} for user in users])
         before = self.snapshot()
         self.assertIn('UUID不可重复', self.run_shell('customUUID', TARGET + '\n').stdout)
-        self.assertIn('email不可重复', self.run_shell('customUserEmail', 'alice\n').stdout)
+        self.assertIn('用户名不可重复', self.run_shell('customUserEmail', 'alice\n').stdout)
         self.assertEqual(before, self.snapshot())
 
     def test_invalid_and_uninstalled_choices_leave_configs_unchanged(self):
@@ -463,6 +464,69 @@ addUser
         result = self.run_shell('viewUserProtocols', env=env)
         alice = result.stdout.split('用户：alice\n')[1].split('\n\n')[0]
         self.assertEqual(alice, '已授权：3.VLESS XHTTP [xray]、4.hysteria2 [sing-box]')
+
+    def test_custom_username_is_preserved_in_config_views_and_subscription(self):
+        for name in ('alice-phone', '张三', 'alice-phone-2'):
+            with self.subTest(name=name):
+                self.reset_configs()
+                self.run_shell('addUser', f'1\n{TARGET}\n{name}\n3\n')
+                users = json.loads(self.run_shell('collectProtocolUserIdentities').stdout)
+                self.assertEqual(next(user['key'] for user in users if user['id'] == TARGET), name)
+                accounts = json.loads(self.run_shell('collectAccountUsers').stdout)
+                self.assertIn(name, [user['key'] for user in accounts])
+                self.assertEqual(self.subscription_protocols(name), [3])
+                self.assertIn(f'用户：{name}\n', self.run_shell('viewUserProtocols').stdout)
+
+    def test_empty_username_keeps_original_uuid_prefix(self):
+        self.run_shell('addUser', f'1\n{TARGET}\n\n3\n')
+        expected_name = TARGET.split('-')[0]
+        users = json.loads(self.run_shell('collectProtocolUserIdentities').stdout)
+        self.assertEqual(next(user['key'] for user in users if user['id'] == TARGET), expected_name)
+        self.assertEqual(self.subscription_protocols(expected_name), [3])
+
+    def test_manually_entered_uuid_name_is_not_abbreviated(self):
+        self.run_shell('addUser', f'1\n{TARGET}\n{TARGET}\n3\n')
+        users = json.loads(self.run_shell('collectProtocolUserIdentities').stdout)
+        self.assertEqual(next(user['key'] for user in users if user['id'] == TARGET), TARGET)
+        self.assertEqual(self.subscription_protocols(TARGET), [3])
+
+    def test_users_with_same_name_prefix_are_independent(self):
+        self.run_shell('addUser', f'1\n{TARGET}\nalice-phone\n3\n')
+        self.run_shell('addUser', f'1\n{OTHER}\nalice-tablet\n1,2\n')
+        users = json.loads(self.run_shell('collectProtocolUserIdentities').stdout)
+        self.assertEqual({user['key'] for user in users}, {'owner', 'alice-phone', 'alice-tablet'})
+        self.assertIn('用户名不可重复', self.run_shell('customUserEmail', 'alice-phone\n').stdout)
+        self.assert_membership(TARGET, [3])
+        self.assert_membership(OTHER, [1, 2])
+        self.assertEqual(self.subscription_protocols('alice-phone'), [3])
+
+    def test_protocol_changes_keep_complete_custom_username(self):
+        self.run_shell('addUser', f'1\n{TARGET}\nalice-phone\n3\n')
+        self.run_shell('manageUserProtocols', '1\n1,2\n')
+        self.assertEqual(self.subscription_protocols('alice-phone'), [1, 2])
+        self.run_shell('removeUser', '1\n')
+        self.assert_membership(TARGET, [])
+        self.assert_owner_unchanged()
+
+    def test_protocol_suffix_does_not_absorb_first_users_name(self):
+        self.run_shell('addUser', f'1\n{TARGET}\nalice-phone\n3\n')
+        self.run_shell(f"setUserProtocols {OWNER} owner '[]'")
+        self.run_shell('addUser', f'1\n{OTHER}\nbob-tablet\n3\n')
+        data = json.loads((self.conf / DEFINITIONS[3][0]).read_text())
+        email = next(client['email'] for client in data['inbounds'][0]['settings']['clients'] if client['id'] == OTHER)
+        self.assertEqual(email, 'bob-tablet-VLESS_Reality_XHTTP')
+
+    def test_initializers_keep_full_custom_name_and_legacy_prefix(self):
+        for core, function in (('xray', 'initXrayClients'), ('sing-box', 'initSingBoxClients')):
+            with self.subTest(core=core):
+                identity = 'id' if core == 'xray' else 'uuid'
+                name_field = 'email' if core == 'xray' else 'name'
+                clients = [{identity: TARGET, name_field: 'alice-phone-VLESS_TCP/TLS_Vision'},
+                           {identity: OWNER, name_field: 'a1b2c3d4-VLESS_TCP/TLS_Vision'}]
+                result = self.run_shell(f'currentClients={shlex.quote(json.dumps(clients))}; {function} 0')
+                actual = json.loads(result.stdout)
+                self.assertEqual([client[name_field] for client in actual],
+                                 ['alice-phone-VLESS_TCP/TLS_Vision', 'a1b2c3d4-VLESS_TCP/TLS_Vision'])
 
     def test_script_keeps_installer_entrypoint(self):
         self.assertEqual(SOURCE.rstrip().splitlines()[-1], 'menu')

@@ -3202,7 +3202,7 @@ initXrayClients() {
     users=[]
     while read -r user; do
         uuid=$(echo "${user}" | jq -r .id//.uuid)
-        email=$(echo "${user}" | jq -r .email//.name | awk -F "[-]" '{print $1}')
+        email=$(accountUserKey "$(echo "${user}" | jq -r .email//.name)")
         currentUser=
         if echo "${type}" | grep -q "0"; then
             currentUser="{\"id\":\"${uuid}\",\"flow\":\"xtls-rprx-vision\",\"email\":\"${email}-VLESS_TCP/TLS_Vision\"}"
@@ -3295,7 +3295,7 @@ initSingBoxClients() {
     users=[]
     while read -r user; do
         uuid=$(echo "${user}" | jq -r .uuid//.id//.password)
-        name=$(echo "${user}" | jq -r .name//.email//.username | awk -F "[-]" '{print $1}')
+        name=$(accountUserKey "$(echo "${user}" | jq -r .name//.email//.username)")
         currentUser=
         # VLESS Vision
         if echo "${type}" | grep -q ",0,"; then
@@ -5511,7 +5511,7 @@ defaultBase64Code() {
     local path=$6
     local outputRoot=${accountSubscriptionLocalRoot:-/etc/v2ray-agent/subscribe_local}
     local user=
-    user=$(echo "${email}" | awk -F "[-]" '{print $1}')
+    user=$(accountUserKey "${email}")
     if [[ "${type}" == "vlessXHTTPTLS" ]]; then
         local xhttpTLSURI
         xhttpTLSURI=$(buildVLESSXHTTPTLSURI "${add}" "${port}" "${id}" "${currentHost}" "${path}" "${currentXHTTPMode:-auto}" "${email}")
@@ -6018,10 +6018,10 @@ getRealitySubscriptionPort() {
     fi
 }
 
-# 从原始账号名得到现有订阅文件使用的用户键。
+# 去掉节点名最后的协议后缀，保留用户名中的连字符。
 accountUserKey() {
     local name=$1
-    printf '%s\n' "${name%%-*}"
+    printf '%s\n' "${name%-*}"
 }
 
 accountUserMatches() {
@@ -6823,18 +6823,20 @@ customUUID() {
     fi
 }
 
-# 自定义email
+# 自定义用户名，留空时沿用原来的随机命名规则。
 customUserEmail() {
-    read -r -p "请输入合法的email，[回车]随机email:" currentCustomEmail
+    read -r -p "请输入用户名，[回车]使用原随机名称:" currentCustomEmail
     echo
     if [[ -z "${currentCustomEmail}" ]]; then
         currentCustomEmail="${currentCustomUUID}"
-        echoContent yellow "email: ${currentCustomEmail}\n"
+        currentCustomUserKey=${currentCustomUUID%%-*}
+        echoContent yellow "用户名: ${currentCustomUserKey}\n"
     else
+        currentCustomUserKey=${currentCustomEmail}
         local checkEmail=
         if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
             local userKey
-            userKey=$(accountUserKey "${currentCustomEmail}")
+            userKey=${currentCustomUserKey}
             if [[ -z "${userKey}" || "${userKey}" == . || "${userKey}" == .. || "${userKey}" == */* || "${userKey}" == *$'\n'* || "${userKey}" == *$'\r'* ]]; then
                 echoContent red " ---> 用户名无法安全用于订阅路径"
                 return 1
@@ -6843,7 +6845,7 @@ customUserEmail() {
         fi
 
         if [[ -n "${checkEmail}" ]]; then
-            echoContent red " ---> email不可重复"
+            echoContent red " ---> 用户名不可重复"
             exit 0
         fi
     fi
@@ -6875,7 +6877,7 @@ collectInstalledUserProtocols() {
                  else empty end |
                  . as $schema |
                  ($file | split("/")[-1] | sub("^[0-9]+_";"") | sub("_inbounds.json$";"")) as $label |
-                 (($schema.clients[0][$schema.name] // "") | split("-")[1:] | join("-")) as $suffix |
+                 (($schema.clients[0][$schema.name] // "") | split("-")[1:] | last // "") as $suffix |
                  ($schema.clients[0].flow //
                     (if $type == "vless" and
                         (($inbound.streamSettings.network // $inbound.transport.type // "tcp") | IN("tcp","raw")) and
@@ -6888,7 +6890,7 @@ collectInstalledUserProtocols() {
                   credentials:(if $type == "tuic" then ["uuid","password"] else [$schema.identity] end),
                   template:((if $flow != "" then {flow:$flow} else {} end) +
                             (if $type == "vmess" and $schema.core == "xray" then {alterId:0} else {} end)),
-                  suffix:(if $suffix != "" then $suffix else $label end),
+                  suffix:(if $suffix != "" then $suffix else ($label | gsub("-";"_")) end),
                   label:($label | gsub("_";" "))}]
             ' "${file}") || return 1
             records=$(jq -c --argjson entries "${entries}" '. + $entries' <<<"${records}") || return 1
@@ -6907,7 +6909,7 @@ collectProtocolUserIdentities() {
         identity=$(jq -r '.identity' <<<"${protocol}")
         name=$(jq -r '.name' <<<"${protocol}")
         entries=$(jq -c --argjson path "${path}" --arg identity "${identity}" --arg name "${name}" --argjson protocol "${protocol}" '
-            [getpath($path)[] | {id:.[$identity],key:((.[$name] // "") | split("-")[0]),
+            [getpath($path)[] | {id:.[$identity],key:((.[$name] // "") | sub("-[^-]*$";"")),
                 protocols:[($protocol | {choice,label,core})]} |
              select(.id != null and .id != "" and .key != "")]' "${file}") || return 1
         users=$(jq -c --argjson entries "${entries}" '. + $entries' <<<"${users}") || return 1
@@ -7049,7 +7051,7 @@ addProtocolUsers() {
         customUUID || return 1
         customUserEmail || return 1
         selectUserProtocols || return 1
-        userKey=$(accountUserKey "${currentCustomEmail}")
+        userKey=${currentCustomUserKey}
         setUserProtocols "${currentCustomUUID}" "${userKey}" "${selectedUserProtocols}" || return 1
         refreshUserSubscriptions || return 1
         count=$((count - 1))
