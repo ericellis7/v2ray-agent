@@ -6077,6 +6077,7 @@ selectAccountUser() {
             index=$((10#${selected}))
             if ((index >= 1 && index <= count)); then
                 accountSelectionKey=$(jq -r --argjson index "$((index - 1))" '.[$index].key' <<<"${users}") || return 1
+                accountSelectionUUID=$(jq -r --argjson index "$((index - 1))" '.[$index].id // empty' <<<"${users}") || return 1
                 return 0
             fi
             echoContent red " ---> 选择无效，请重试"
@@ -6811,12 +6812,8 @@ customUUID() {
 
     else
         local checkUUID=
-        if [[ "${coreInstallType}" == "1" ]]; then
-            local referenceConfig
-            referenceConfig=$(getXrayAccountReferenceConfig) || return 1
-            checkUUID=$(jq -r --arg currentUUID "$currentCustomUUID" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]? | select(.id == $currentUUID or .password == $currentUUID) | .email' "${referenceConfig}")
-        elif [[ "${coreInstallType}" == "2" ]]; then
-            checkUUID=$(jq -r --arg currentUUID "$currentCustomUUID" ".inbounds[0].users[] | select(.uuid == \$currentUUID) | .name//.username" ${configPath}${frontingType}.json)
+        if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
+            checkUUID=$(collectProtocolUserIdentities | jq -r --arg id "${currentCustomUUID}" '.[] | select(.id == $id) | .key') || return 1
         fi
 
         if [[ -n "${checkUUID}" ]]; then
@@ -6835,18 +6832,14 @@ customUserEmail() {
         echoContent yellow "email: ${currentCustomEmail}\n"
     else
         local checkEmail=
-        if [[ "${coreInstallType}" == "1" ]]; then
-            local frontingTypeConfig="${frontingType}"
-            if [[ "${currentInstallProtocolType}" == ",7,8," ]]; then
-                frontingTypeConfig="07_VLESS_vision_reality_inbounds"
+        if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
+            local userKey
+            userKey=$(accountUserKey "${currentCustomEmail}")
+            if [[ -z "${userKey}" || "${userKey}" == . || "${userKey}" == .. || "${userKey}" == */* || "${userKey}" == *$'\n'* || "${userKey}" == *$'\r'* ]]; then
+                echoContent red " ---> 用户名无法安全用于订阅路径"
+                return 1
             fi
-            local referenceConfig
-            referenceConfig=$(getXrayAccountReferenceConfig) || return 1
-            checkEmail=$(jq -r --arg currentEmail "$currentCustomEmail" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]? | select(.email == $currentEmail) | .email' "${referenceConfig}")
-        elif
-            [[ "${coreInstallType}" == "2" ]]
-        then
-            checkEmail=$(jq -r --arg currentEmail "$currentCustomEmail" ".inbounds[0].users[] | select(.name == \$currentEmail) | .name" ${configPath}${frontingType}.json)
+            checkEmail=$(collectAccountUsers | jq -r --arg key "${userKey}" '.[] | select(.key == $key) | .key') || return 1
         fi
 
         if [[ -n "${checkEmail}" ]]; then
@@ -6856,340 +6849,245 @@ customUserEmail() {
     fi
 }
 
-# 添加用户
-addUser() {
-    read -r -p "请输入要添加的用户数量:" userNum
-    echo
-    if [[ -z ${userNum} || ${userNum} -le 0 ]]; then
-        echoContent red " ---> 输入有误，请重新输入"
-        exit 0
+# 从已安装入站生成用户协议列表，编号随当前列表生成。
+collectInstalledUserProtocols() {
+    local dir file records='[]' entries
+    local seenFiles=$'\n'
+    for dir in "${configPath}" "${singBoxConfigPath}"; do
+        [[ -n "${dir}" && -d "${dir}" ]] || continue
+        for file in "${dir%/}/"*_inbounds.json; do
+            [[ -f "${file}" ]] || continue
+            case "${seenFiles}" in *$'\n'"${file}"$'\n'*) continue ;; esac
+            seenFiles+="${file}"$'\n'
+            entries=$(jq -c --arg file "${file}" '
+                [.inbounds | to_entries[] | .key as $index | .value as $inbound |
+                 ($inbound.protocol // $inbound.type) as $type |
+                 if ($inbound.settings.clients | type) == "array" and
+                    (["vless", "vmess", "trojan"] | index($type)) != null then
+                     {core:"xray", path:["inbounds",$index,"settings","clients"],
+                      identity:(if $type == "trojan" then "password" else "id" end),
+                      name:"email", clients:$inbound.settings.clients}
+                 elif ($inbound.users | type) == "array" and
+                      (["vless", "vmess", "trojan", "hysteria2", "tuic", "naive", "anytls"] | index($type)) != null then
+                     {core:"sing-box", path:["inbounds",$index,"users"],
+                      identity:(if (["vless","vmess","tuic"] | index($type)) != null then "uuid" else "password" end),
+                      name:(if $type == "naive" then "username" else "name" end), clients:$inbound.users}
+                 else empty end |
+                 . as $schema |
+                 ($file | split("/")[-1] | sub("^[0-9]+_";"") | sub("_inbounds.json$";"")) as $label |
+                 (($schema.clients[0][$schema.name] // "") | split("-")[1:] | join("-")) as $suffix |
+                 ($schema.clients[0].flow //
+                    (if $type == "vless" and
+                        (($inbound.streamSettings.network // $inbound.transport.type // "tcp") | IN("tcp","raw")) and
+                        (($inbound.streamSettings.security // "") | IN("tls","reality")) then "xtls-rprx-vision"
+                     elif $type == "vless" and $schema.core == "sing-box" and
+                          $inbound.tls.enabled == true and $inbound.transport == null then "xtls-rprx-vision"
+                     else "" end)) as $flow |
+                 {file:$file, index:$index, core:$schema.core, path:$schema.path,
+                  identity:$schema.identity, name:$schema.name,
+                  credentials:(if $type == "tuic" then ["uuid","password"] else [$schema.identity] end),
+                  template:((if $flow != "" then {flow:$flow} else {} end) +
+                            (if $type == "vmess" and $schema.core == "xray" then {alterId:0} else {} end)),
+                  suffix:(if $suffix != "" then $suffix else $label end),
+                  label:($label | gsub("_";" "))}]
+            ' "${file}") || return 1
+            records=$(jq -c --argjson entries "${entries}" '. + $entries' <<<"${records}") || return 1
+        done
+    done
+    jq -c 'sort_by(.file,.index) | to_entries | map(.value + {choice:(.key + 1)})' <<<"${records}"
+}
+
+# 从所有已安装协议收集账号，包含只授权单个协议的用户。
+collectProtocolUserIdentities() {
+    local protocols entries users='[]' protocol file path identity name
+    protocols=$(collectInstalledUserProtocols) || return 1
+    while IFS= read -r protocol; do
+        file=$(jq -r '.file' <<<"${protocol}")
+        path=$(jq -c '.path' <<<"${protocol}")
+        identity=$(jq -r '.identity' <<<"${protocol}")
+        name=$(jq -r '.name' <<<"${protocol}")
+        entries=$(jq -c --argjson path "${path}" --arg identity "${identity}" --arg name "${name}" '
+            [getpath($path)[] | {id:.[$identity],key:((.[$name] // "") | split("-")[0])} |
+             select(.id != null and .id != "" and .key != "")]' "${file}") || return 1
+        users=$(jq -c --argjson entries "${entries}" '. + $entries' <<<"${users}") || return 1
+    done < <(jq -c '.[]' <<<"${protocols}")
+    jq -c 'group_by(.id) | map({id:.[0].id,key:.[0].key}) | sort_by(.key,.id)' <<<"${users}"
+}
+
+readUserProtocols() {
+    local uuidValue=$1 protocols protocol choice file path identity selected='[]'
+    protocols=$(collectInstalledUserProtocols) || return 1
+    while IFS= read -r protocol; do
+        file=$(jq -r '.file' <<<"${protocol}")
+        path=$(jq -c '.path' <<<"${protocol}")
+        identity=$(jq -r '.identity' <<<"${protocol}")
+        choice=$(jq -r '.choice' <<<"${protocol}")
+        if jq -e --arg id "${uuidValue}" --argjson path "${path}" --arg identity "${identity}" \
+            'any(getpath($path)[]; .[$identity] == $id)' "${file}" >/dev/null; then
+            selected=$(jq -c --argjson choice "${choice}" '. + [$choice]' <<<"${selected}") || return 1
+        fi
+    done < <(jq -c '.[]' <<<"${protocols}")
+    printf '%s\n' "${selected}"
+}
+
+selectUserProtocols() {
+    local defaults=${1:-} protocols available selection
+    protocols=$(collectInstalledUserProtocols) || return 1
+    available=$(jq -c '[.[].choice]' <<<"${protocols}") || return 1
+    if [[ "${available}" == '[]' ]]; then
+        echoContent red " ---> 未找到已安装且支持用户订阅的协议"
+        return 1
     fi
-    local userConfig=
-    if [[ "${coreInstallType}" == "1" ]]; then
-        userConfig=".inbounds[0].settings.clients"
-    elif [[ "${coreInstallType}" == "2" ]]; then
-        userConfig=".inbounds[0].users"
+    echoContent skyBlue "\n请选择该用户允许使用的已安装协议："
+    jq -r '.[] | "\(.choice).\(.label) [\(.core)]"' <<<"${protocols}"
+    if [[ -z "${defaults}" || "${defaults}" == '[]' ]]; then
+        defaults=${available}
     fi
-    while [[ ${userNum} -gt 0 ]]; do
+    defaults=$(jq -r 'join(",")' <<<"${defaults}") || return 1
+    read -r -p "请输入当前列表编号，可多选（例：1,3），[回车]使用 ${defaults}:" selection || return 1
+    selection=${selection// /}
+    selection=${selection:-${defaults}}
+    if ! selectedUserProtocols=$(jq -cen --arg selection "${selection}" --argjson available "${available}" '
+        select($selection | test("^[0-9]+(,[0-9]+)*$")) |
+        ($selection | split(",") | map(tonumber) | unique) as $requested |
+        select((($requested - $available) | length) == 0) | $requested'); then
+        echoContent red " ---> 请选择当前列表中的编号，使用英文逗号分隔"
+        return 1
+    fi
+}
+
+# 只修改指定用户的授权；复用现有配置检查、备份恢复和事务重启。
+setUserProtocols() {
+    local uuidValue=$1 userKey=$2 selected=$3 protocols
+    local backupDir file tmpFile position=0 failed=false
+    local -a files=()
+    protocols=$(collectInstalledUserProtocols) || return 1
+    backupDir=$(mktemp -d "${TMPDIR:-/tmp}/v2ray-agent-user-protocols.XXXXXX") || return 1
+    mapfile -t files < <(jq -r '[.[].file] | unique[]' <<<"${protocols}")
+    for file in "${files[@]}"; do
+        if ! cp -p "${file}" "${backupDir}/${position}.backup" ||
+            ! jq -e --arg id "${uuidValue}" --arg user "${userKey}" --arg file "${file}" \
+                --argjson protocols "${protocols}" --argjson selected "${selected}" '
+                reduce ($protocols[] | select(.file == $file)) as $protocol (.;
+                    getpath($protocol.path) as $clients |
+                    setpath($protocol.path;
+                        if ($selected | index($protocol.choice)) != null then
+                            if any($clients[]; .[$protocol.identity] == $id) then $clients
+                            else $clients + [
+                                (reduce $protocol.credentials[] as $field ($protocol.template; .[$field] = $id)) |
+                                .[$protocol.name] = ($user + "-" + $protocol.suffix)
+                            ] end
+                        else [$clients[] | select(.[$protocol.identity] != $id)] end))' \
+                "${file}" >"${backupDir}/${position}.json"; then
+            rm -rf "${backupDir}"
+            return 1
+        fi
+        position=$((position + 1))
+    done
+    position=0
+    for file in "${files[@]}"; do
+        if ! cmp -s "${backupDir}/${position}.backup" "${backupDir}/${position}.json"; then
+            tmpFile=$(mktemp "${file}.users.XXXXXX") || { failed=true; break; }
+            if ! cp -p "${file}" "${tmpFile}" ||
+                ! cat "${backupDir}/${position}.json" >"${tmpFile}" ||
+                ! mv -f "${tmpFile}" "${file}"; then
+                rm -f "${tmpFile}"
+                failed=true
+                break
+            fi
+        fi
+        position=$((position + 1))
+    done
+    if [[ "${failed}" == false && "${coreInstallType}" == "1" ]] && ! "${ctlPath}" run -test -confdir "${configPath}"; then
+        failed=true
+    fi
+    if [[ "${failed}" == false && -n "${singBoxConfigPath}" ]]; then
+        local singBoxCtl="${singBoxConfigPath%/conf/config/}/sing-box"
+        if ! "${singBoxCtl}" merge "${backupDir}/sing-box.json" -C "${singBoxConfigPath}" -D "${singBoxConfigPath%config/}" ||
+            ! "${singBoxCtl}" check -c "${backupDir}/sing-box.json" -D "${singBoxConfigPath%config/}"; then
+            failed=true
+        fi
+    fi
+    if [[ "${failed}" == true ]]; then
+        if restoreXrayUserConfigs "${backupDir}" "${files[@]}"; then
+            rm -rf "${backupDir}"
+        else
+            echoContent red " ---> 恢复配置失败，备份保留在： ${backupDir}"
+        fi
+        return 1
+    fi
+    if ! reloadCore transaction; then
+        if restoreXrayUserConfigs "${backupDir}" "${files[@]}" && reloadCore transaction; then
+            rm -rf "${backupDir}"
+        else
+            echoContent red " ---> 恢复服务失败，备份保留在： ${backupDir}"
+        fi
+        return 1
+    fi
+    rm -rf "${backupDir}"
+}
+
+refreshUserSubscriptions() {
+    readNginxSubscribe
+    if [[ -n "${subscribePort}" ]] && ! subscribe false; then
+        echoContent red " ---> 用户授权已生效，但订阅刷新失败，请使用 6.生成/更新订阅重试"
+        return 1
+    fi
+}
+
+addProtocolUsers() {
+    local count userKey
+    read -r -p "请输入要添加的用户数量:" count || return 1
+    if [[ ! "${count}" =~ ^[1-9][0-9]*$ ]]; then
+        echoContent red " ---> 请输入大于零的用户数量"
+        return 1
+    fi
+    while ((count > 0)); do
         readConfigHostPathUUID
-        local users=
-        ((userNum--)) || true
-
-        customUUID
-        customUserEmail
-
-        uuid=${currentCustomUUID}
-        email=${currentCustomEmail}
-
-        # VLESS TCP
-        if echo "${currentInstallProtocolType}" | grep -q ",0,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 0 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 0 "${uuid}" "${email}")
-            fi
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}02_VLESS_TCP_inbounds.json)
-            echo "${clients}" | jq . >${configPath}02_VLESS_TCP_inbounds.json
-        fi
-
-        # VLESS WS
-        if echo "${currentInstallProtocolType}" | grep -q ",1,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 1 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 1 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}03_VLESS_WS_inbounds.json)
-            echo "${clients}" | jq . >${configPath}03_VLESS_WS_inbounds.json
-        fi
-
-        # VLESS XHTTP TLS tunnel
-        if echo "${currentInstallProtocolType}" | grep -q ",14," && [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-            local clients xhttpTLSResult
-            clients=$(initXrayClients 14 "${uuid}" "${email}")
-            xhttpTLSResult=$(jq --argjson clients "${clients}" '.inbounds[0].settings.clients = $clients' "${configPath}14_VLESS_XHTTP_TLS_inbounds.json")
-            echo "${xhttpTLSResult}" | jq . >"${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
-        fi
-        # VLESS Reality XHTTP
-        if echo "${currentInstallProtocolType}" | grep -q ",12," && [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]]; then
-            local clients xhttpRealityResult
-            clients=$(initXrayClients 12 "${uuid}" "${email}")
-            xhttpRealityResult=$(jq --argjson clients "${clients}" '.inbounds[0].settings.clients = $clients' "${configPath}12_VLESS_XHTTP_inbounds.json")
-            echo "${xhttpRealityResult}" | jq . >"${configPath}12_VLESS_XHTTP_inbounds.json"
-        fi
-
-        # trojan grpc
-        if echo "${currentInstallProtocolType}" | grep -q ",2,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 2 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 2 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}04_trojan_gRPC_inbounds.json)
-            echo "${clients}" | jq . >${configPath}04_trojan_gRPC_inbounds.json
-        fi
-        # VMess WS
-        if echo "${currentInstallProtocolType}" | grep -q ",3,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 3 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 3 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}05_VMess_WS_inbounds.json)
-            echo "${clients}" | jq . >${configPath}05_VMess_WS_inbounds.json
-        fi
-        # trojan tcp
-        if echo "${currentInstallProtocolType}" | grep -q ",4,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 4 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 4 "${uuid}" "${email}")
-            fi
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}04_trojan_TCP_inbounds.json)
-            echo "${clients}" | jq . >${configPath}04_trojan_TCP_inbounds.json
-        fi
-
-        # vless grpc
-        if echo "${currentInstallProtocolType}" | grep -q ",5,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 5 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 5 "${uuid}" "${email}")
-            fi
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}06_VLESS_gRPC_inbounds.json)
-            echo "${clients}" | jq . >${configPath}06_VLESS_gRPC_inbounds.json
-        fi
-
-        # vless reality vision
-        if echo "${currentInstallProtocolType}" | grep -q ",7,"; then
-            local clients=
-            local realityUserConfig=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 7 "${uuid}" "${email}")
-                realityUserConfig=".inbounds[1].settings.clients"
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 7 "${uuid}" "${email}")
-                realityUserConfig=".inbounds[0].users"
-            fi
-            clients=$(jq -r "${realityUserConfig} = ${clients}" ${configPath}07_VLESS_vision_reality_inbounds.json)
-            echo "${clients}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
-        fi
-
-        # vless reality grpc
-        if echo "${currentInstallProtocolType}" | grep -q ",8,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 8 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 8 "${uuid}" "${email}")
-            fi
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}08_VLESS_vision_gRPC_inbounds.json)
-            echo "${clients}" | jq . >${configPath}08_VLESS_vision_gRPC_inbounds.json
-        fi
-
-        # hysteria2
-        if echo ${currentInstallProtocolType} | grep -q ",6,"; then
-            local clients=
-
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 6 "${uuid}" "${email}")
-            elif [[ -n "${singBoxConfigPath}" ]]; then
-                clients=$(initSingBoxClients 6 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r ".inbounds[0].users = ${clients}" "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            echo "${clients}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
-        fi
-
-        # tuic
-        if echo ${currentInstallProtocolType} | grep -q ",9,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 9 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 9 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r ".inbounds[0].users = ${clients}" "${singBoxConfigPath}09_tuic_inbounds.json")
-
-            echo "${clients}" | jq . >"${singBoxConfigPath}09_tuic_inbounds.json"
-        fi
-        # naive
-        if echo ${currentInstallProtocolType} | grep -q ",10,"; then
-            local clients=
-            clients=$(initSingBoxClients 10 "${uuid}" "${email}")
-            clients=$(jq -r ".inbounds[0].users = ${clients}" "${singBoxConfigPath}10_naive_inbounds.json")
-
-            echo "${clients}" | jq . >"${singBoxConfigPath}10_naive_inbounds.json"
-        fi
-        # VMess WS
-        if echo "${currentInstallProtocolType}" | grep -q ",11,"; then
-            local clients=
-            if [[ "${coreInstallType}" == "1" ]]; then
-                clients=$(initXrayClients 11 "${uuid}" "${email}")
-            elif [[ "${coreInstallType}" == "2" ]]; then
-                clients=$(initSingBoxClients 11 "${uuid}" "${email}")
-            fi
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}11_VMess_HTTPUpgrade_inbounds.json)
-            echo "${clients}" | jq . >${configPath}11_VMess_HTTPUpgrade_inbounds.json
-        fi
-        # anytls
-        if echo "${currentInstallProtocolType}" | grep -q ",13,"; then
-            local clients=
-            clients=$(initSingBoxClients 13 "${uuid}" "${email}")
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
-            echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
-        fi
+        customUUID || return 1
+        customUserEmail || return 1
+        selectUserProtocols || return 1
+        userKey=$(accountUserKey "${currentCustomEmail}")
+        setUserProtocols "${currentCustomUUID}" "${userKey}" "${selectedUserProtocols}" || return 1
+        refreshUserSubscriptions || return 1
+        count=$((count - 1))
     done
     echoContent green " ---> 添加完成"
-    readNginxSubscribe
-    if [[ -n "${subscribePort}" ]]; then
-        subscribe false
-    fi
     manageAccount 1
 }
+
+manageUserProtocols() {
+    local users current
+    users=$(collectProtocolUserIdentities) || return 1
+    selectAccountUser "${users}" || return 0
+    current=$(readUserProtocols "${accountSelectionUUID}") || return 1
+    echoContent yellow " ---> 当前用户：${accountSelectionKey}，已授权协议：$(jq -r 'join(",")' <<<"${current}")"
+    selectUserProtocols "${current}" || return 1
+    setUserProtocols "${accountSelectionUUID}" "${accountSelectionKey}" "${selectedUserProtocols}" || return 1
+    echoContent green " ---> 用户协议已更新"
+    refreshUserSubscriptions || return 1
+    manageAccount 1
+}
+
+# 添加用户
+addUser() {
+    addProtocolUsers
+}
+
 # 移除用户
 removeUser() {
-
-    local delUserIndex=
-    local uuid=
-    local referenceConfig=
-    if [[ "${coreInstallType}" == "1" ]]; then
-        referenceConfig=$(getXrayAccountReferenceConfig) || {
-            echoContent red " ---> 未找到可管理的Xray用户配置"
-            return 1
-        }
-        jq -r -c '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]?|.email' "${referenceConfig}" | awk '{print NR""":"$0}'
-        read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
-        if ! delUserIndex=$(jq -enr --arg index "${delUserIndex}" \
-            --argjson count "$(jq '(.inbounds[0].settings.clients // .inbounds[1].settings.clients) | length' "${referenceConfig}")" '
-              select($index | test("^[0-9]+$")) | ($index | tonumber) |
-              select(. >= 1 and . <= $count) | . - 1'); then
-            echoContent red " ---> 选择错误"
-            return 1
-        else
-            uuid=$(jq -r --argjson index "${delUserIndex}" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[$index].id // (.inbounds[0].settings.clients // .inbounds[1].settings.clients)[$index].password // empty' "${referenceConfig}")
-            [[ -n "${uuid}" ]] || {
-                echoContent red " ---> 无法读取所选用户的UUID"
-                return 1
-            }
-        fi
-        if ! deleteXrayUserByUUID "${uuid}"; then
-            echoContent red " ---> 删除用户失败，请检查上方错误信息"
-            return 1
-        fi
-        echoContent green " ---> 删除用户完成"
-        readNginxSubscribe
-        if [[ -n "${subscribePort}" ]]; then
-            subscribe false || echoContent red " ---> 用户已删除，但订阅刷新失败"
-        fi
-        manageAccount 1
-        return
-    elif [[ "${coreInstallType}" == "2" ]]; then
-        jq -r -c .inbounds[0].users[].name//.inbounds[0].users[].username ${configPath}${frontingType:-$frontingTypeReality}.json | awk '{print NR""":"$0}'
-        read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
-        if [[ $(jq -r '.inbounds[0].users|length' ${configPath}${frontingType:-$frontingTypeReality}.json) -lt ${delUserIndex} ]]; then
-            echoContent red " ---> 选择错误"
-            return 1
-        else
-            delUserIndex=$((delUserIndex - 1))
-        fi
+    local users
+    users=$(collectProtocolUserIdentities) || return 1
+    selectAccountUser "${users}" || return 0
+    if ! setUserProtocols "${accountSelectionUUID}" "${accountSelectionKey}" '[]'; then
+        echoContent red " ---> 删除用户失败，请检查上方错误信息"
+        return 1
     fi
-
-    if [[ -n "${delUserIndex}" ]]; then
-
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",0,"; then
-            local vlessVision
-            vlessVision=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}02_VLESS_TCP_inbounds.json)
-            echo "${vlessVision}" | jq . >${configPath}02_VLESS_TCP_inbounds.json
-        fi
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",1,"; then
-            local vlessWSResult
-            vlessWSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}03_VLESS_WS_inbounds.json)
-            echo "${vlessWSResult}" | jq . >${configPath}03_VLESS_WS_inbounds.json
-        fi
-
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",2,"; then
-            local trojangRPCUsers
-            trojangRPCUsers=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"')' ${configPath}04_trojan_gRPC_inbounds.json)
-            echo "${trojangRPCUsers}" | jq . >${configPath}04_trojan_gRPC_inbounds.json
-        fi
-
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",3,"; then
-            local vmessWSResult
-            vmessWSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}05_VMess_WS_inbounds.json)
-            echo "${vmessWSResult}" | jq . >${configPath}05_VMess_WS_inbounds.json
-        fi
-
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",5,"; then
-            local vlessGRPCResult
-            vlessGRPCResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}06_VLESS_gRPC_inbounds.json)
-            echo "${vlessGRPCResult}" | jq . >${configPath}06_VLESS_gRPC_inbounds.json
-        fi
-
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",4,"; then
-            local trojanTCPResult
-            trojanTCPResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}04_trojan_TCP_inbounds.json)
-            echo "${trojanTCPResult}" | jq . >${configPath}04_trojan_TCP_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",6,"; then
-            local hysteriaResult
-            hysteriaResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            echo "${hysteriaResult}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
-        fi
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",7,"; then
-            local vlessRealityResult
-            vlessRealityResult=$(jq -r 'del(.inbounds[1].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}07_VLESS_vision_reality_inbounds.json)
-            echo "${vlessRealityResult}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
-        fi
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",8,"; then
-            local vlessRealityGRPCResult
-            vlessRealityGRPCResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"']//.inbounds[0].users['"${delUserIndex}"'])' ${configPath}08_VLESS_vision_gRPC_inbounds.json)
-            echo "${vlessRealityGRPCResult}" | jq . >${configPath}08_VLESS_vision_gRPC_inbounds.json
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",9,"; then
-            local tuicResult
-            tuicResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}09_tuic_inbounds.json")
-            echo "${tuicResult}" | jq . >"${singBoxConfigPath}09_tuic_inbounds.json"
-        fi
-        if echo ${currentInstallProtocolType} | grep -q ",10,"; then
-            local naiveResult
-            naiveResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}10_naive_inbounds.json")
-            echo "${naiveResult}" | jq . >"${singBoxConfigPath}10_naive_inbounds.json"
-        fi
-        # VMess HTTPUpgrade
-        if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",11,"; then
-            local vmessHTTPUpgradeResult
-            vmessHTTPUpgradeResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}11_VMess_HTTPUpgrade_inbounds.json")
-            echo "${vmessHTTPUpgradeResult}" | jq . >"${singBoxConfigPath}11_VMess_HTTPUpgrade_inbounds.json"
-            echo "${vmessHTTPUpgradeResult}" | jq . >${configPath}11_VMess_HTTPUpgrade_inbounds.json
-        fi
-        # AnyTLS
-        if echo ${currentInstallProtocolType} | grep -q ",13,"; then
-            local anyTLSResult
-            anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
-            echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
-        fi
-        readNginxSubscribe
-        if [[ -n "${subscribePort}" ]]; then
-            subscribe false
-        fi
-    fi
+    echoContent green " ---> 删除用户完成"
+    refreshUserSubscriptions || return 1
     manageAccount 1
 }
+
 # 更新脚本
 updateV2RayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新v2ray-agent脚本"
@@ -9650,13 +9548,14 @@ manageAccount() {
 
     echoContent red "\n=============================================================="
     echoContent yellow "# 添加单个用户时可自定义email和uuid"
-    echoContent yellow "# 如安装了Hysteria或者Tuic，账号会同时添加到相应的类型下面\n"
+    echoContent yellow "# 从已安装协议列表选择单个协议或组合，无需重新安装\n"
     echoContent yellow "1.查看账号"
     echoContent yellow "2.查看订阅"
     echoContent yellow "3.管理其他订阅"
     echoContent yellow "4.添加用户"
     echoContent yellow "5.删除用户"
     echoContent yellow "6.生成/更新订阅（全部用户）"
+    echoContent yellow "7.修改用户协议（从已安装列表选择）"
     echoContent red "=============================================================="
     read -r -p "请输入:" manageAccountStatus
     if [[ "${manageAccountStatus}" == "1" ]]; then
@@ -9671,6 +9570,8 @@ manageAccount() {
         removeUser
     elif [[ "${manageAccountStatus}" == "6" ]]; then
         subscribe
+    elif [[ "${manageAccountStatus}" == "7" ]]; then
+        manageUserProtocols
     else
         echoContent red " ---> 选择错误"
     fi
