@@ -4773,7 +4773,7 @@ EOF
     if echo "${selectCustomInstallType}" | grep -q ",14," || [[ "$1" == "all" ]]; then
         initXrayXHTTPTLSPort
 
-        buildXrayXHTTPTLSConfig "${xHTTPTLSPort}" "${domain}" "${customPath}" "$(initXrayClients 14)" | jq . >"${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+        buildXrayXHTTPTLSConfig "${xHTTPTLSPort}" "${domain}" "${customPath}" "$(initXrayClients 14)" | jq . >/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json >/dev/null 2>&1
     fi

@@ -334,6 +334,76 @@ addUser
         self.run_shell(body, '1,10,12\n')
         self.assert_catalog_membership([1, 10, 12])
 
+    def test_fresh_xray_install_discovers_every_selected_protocol(self):
+        definitions = '\n\n'.join(extract_function(name) for name in (
+            'normalizeXrayInstallSelection', 'buildXrayXHTTPTLSConfig',
+            'buildVLESSXHTTPTLSURI', 'buildMihomoXHTTPTLSNode',
+            'uniqueCDNAddresses', 'listXHTTPTLSEndpoints', 'buildXHTTPTLSNodeName',
+            'isValidXHTTPTLSPort', 'initXrayXHTTPTLSPort', 'initXrayConfig', 'showAccounts'))
+        definitions = definitions.replace('/etc/v2ray-agent/xray/conf', str(self.conf))
+        definitions = definitions.replace('/etc/v2ray-agent/cdn', str(self.root / 'cdn'))
+        with self.helpers.open('a') as helper:
+            helper.write('\n' + definitions + '\n')
+        for selection, expected in (
+                ('0,7,12,14', ['VLESS TCP', 'VLESS vision reality', 'VLESS XHTTP', 'VLESS XHTTP TLS']),
+                ('14', ['VLESS XHTTP TLS'])):
+            with self.subTest(selection=selection):
+                for file in self.conf.glob('*.json'):
+                    file.unlink()
+                install_cwd = self.root / ('install-' + selection.replace(',', '-'))
+                install_cwd.mkdir()
+                body = f"""
+cd {shlex.quote(str(install_cwd))}
+configPath=
+currentUUID={OWNER}
+currentClients='[{{"id":"{OWNER}","email":"owner-VLESS_TCP/TLS_Vision"}}]'
+lastInstallationConfig=true
+selectCustomInstallType=$(normalizeXrayInstallSelection {shlex.quote(selection)})
+domain=node.example.test
+port=443
+customPath=test
+xrayVLESSXHTTPTLSPort=24445
+addXrayOutbound() {{ :; }}
+removeXrayOutbound() {{ :; }}
+initXrayXHTTPort() {{ xHTTPort=24444; }}
+initXrayRealityPort() {{ realityPort=24443; }}
+initRealityClientServersName() {{ realityServerName=target.example.test; realityDomainPort=443; }}
+initRealityKey() {{ realityPrivateKey=test-private; realityPublicKey=test-public; }}
+initRealityMldsa65() {{ realityMldsa65Seed=; realityMldsa65Verify=; }}
+checkPort() {{ return 0; }}
+allowPort() {{ :; }}
+installSniffing() {{ configPath={shlex.quote(str(self.conf) + '/')}; }}
+initXrayConfig custom 9 > install.log
+collectInstalledUserProtocols
+"""
+                entries = json.loads(self.run_shell(body).stdout)
+                self.assertEqual([entry['label'] for entry in entries], expected)
+                self.assertFalse((install_cwd / '14_VLESS_XHTTP_TLS_inbounds.json').exists())
+                tls = json.loads((self.conf / '14_VLESS_XHTTP_TLS_inbounds.json').read_text())
+                self.assertEqual(tls['inbounds'][1]['port'], 24445)
+                self.assertEqual(tls['inbounds'][0]['settings']['clients'][0]['id'], OWNER)
+                self.assertEqual(tls['inbounds'][0]['streamSettings']['security'], 'tls')
+                self.apply([entry['choice'] for entry in entries])
+                self.assert_catalog_membership([entry['choice'] for entry in entries])
+                output = install_cwd / 'subscription'
+                self.run_shell(f"""
+currentInstallProtocolType=$(normalizeXrayInstallSelection {shlex.quote(selection)})
+xrayVLESSXHTTPTLSPort=24445
+showAccounts 1 alice {shlex.quote(str(output))}
+""")
+                uris = (output / 'default' / 'alice').read_text().splitlines()
+                self.assertEqual(len(uris), len(expected))
+                tls_uri = next(urlsplit(uri) for uri in uris if urlsplit(uri).port == 24445)
+                self.assertEqual(tls_uri.username, TARGET)
+                args = parse_qs(tls_uri.query)
+                self.assertEqual(args['security'], ['tls'])
+                self.assertEqual(args['type'], ['xhttp'])
+                self.assertEqual(args['sni'], ['node.example.test'])
+                self.assertEqual(args['path'], ['/testxHTTP'])
+                clash = (output / 'clashMeta' / 'alice').read_text()
+                self.assertIn('alice-VLESS_XHTTP_TLS', clash)
+                self.assertIn('port: 24445', clash)
+
     def test_original_xray_families_use_correct_credentials(self):
         for filename, protocol, network, security in (
                 ('03_VLESS_WS_inbounds.json', 'vless', 'ws', 'tls'),
